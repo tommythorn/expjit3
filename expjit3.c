@@ -15,6 +15,9 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
 
 /*
  * Lexical analysis
@@ -255,7 +258,7 @@ static void unparse(ast_t t)
  * Symbol table handling is unrealistically simplistic here.
  */
 
-static char code[9999], *cp = code;
+static char *code, *cp;
 static int env[256] = { ['x'] = 2, ['y'] = 3 };
 static int instructions = 0;
 static int cse_values[9999], *cse_p = cse_values;
@@ -308,6 +311,23 @@ static void codegen(ast_t t)
  * Main.
  */
 
+// Allocates RWX memory of given size and returns a pointer to it. On failure,
+// prints out the error and returns NULL.
+void* alloc_executable_memory(size_t size)
+{
+        void* ptr = mmap(0, size,
+                         PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr == (void*)-1) {
+                perror("mmap");
+                return NULL;
+        }
+        return ptr;
+}
+
+
+
+
 typedef int (*int_function_pointer)();
 
 int main(int argc, char **argv)
@@ -325,7 +345,11 @@ int main(int argc, char **argv)
         unparse(res);
         printf("\n");
 
+        cp = code = alloc_executable_memory(9999);
+
+        *cp++ = 0x53; // push %ebx
         codegen(res);
+        *cp++ = 0x5B; // pop %ebx
         *cp++ = 0xC3; // ret
         ++instructions;
         printf("%d instruction, value %d\n",
