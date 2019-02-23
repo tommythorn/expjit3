@@ -7,17 +7,19 @@
  * - AST transformation, and
  * - (dynamic) native code generation.
  *
- * This example expects to be run on a 32-bit x86.  For 64-bit Linux,
- * compile with gcc -m32.
+ * This example expects to be run on a RISC-V RV64GC.
  *
  * Tommy Thorn 2006-09-18, placed in the public domain.
+ * Tommy Thorn 2019-02-22, ported to RISC-V
  */
 
+#include <assert.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <stdint.h>
 
 /*
  * Lexical analysis
@@ -31,12 +33,12 @@ typedef enum {
         NAME,
 } token_t;
 
-static char    *s;		// Source code pointer
+static char    *s;              // Source code pointer
 static token_t  lookahead;
 static int      intValue;
-static char    *symbolValue;	// Pointing to a place in the source.
-static unsigned symbolLength;  // Length of same (which is *not* zero terminated)
-                        // XXX Not used in this example
+static char    *symbolValue;    // Pointing to a place in the source.
+static unsigned symbolLength;   // Length of same (which is *not* zero terminated)
+                                // XXX Not used in this example
 
 /*
  * Produce the next token in `lookahead' from the source code pointed
@@ -82,11 +84,13 @@ static void match(token_t expect)
 
 typedef struct node *ast_t;
 static struct node {
-        token_t kind;	// great correspondence means we reuse the type here
-        ast_t l, r;	// left and right subtrees
-        int intValue;	// irrelevant unless kind == INT
-        int shared;	// this node is shared (eg. a common sub expression)
-        int *saved;	// for the code generation
+        token_t kind;   // great correspondence means we reuse the type here
+        ast_t l, r;     // left and right subtrees
+        int intValue;   // irrelevant unless kind == INT
+
+        int shared;     // this node is shared (eg. a common sub expression)
+        int alloc;      // if nonzero, the desired register
+        int reg;        // for the code generation
 } nodes[9999];
 
 static int next = 0;
@@ -119,7 +123,7 @@ static ast_t mk(token_t kind, ast_t l, ast_t r, int k)
 
         for (p = &nodes[0]; p != &nodes[next]; ++p)
                 if (p->kind == kind && p->l == l && p->r == r && p->intValue == k) {
-                        p->shared = 1;
+                        p->shared++;
                         return p;
                 }
 
@@ -164,8 +168,9 @@ static ast_t mk(token_t kind, ast_t l, ast_t r, int k)
         nodes[next].l = l;
         nodes[next].r = r;
         nodes[next].intValue = k;
-        nodes[next].shared = 0;
-        nodes[next].saved = 0;
+        nodes[next].shared = 1;
+        nodes[next].alloc = 0;
+        nodes[next].reg = 0;
         return &nodes[next++];
 }
 
@@ -243,10 +248,12 @@ static void unparse(ast_t t)
 /*
  * Code generation.
  *
- * Classic template expansion. For a stack machine code generation is
- * trivial. Expressions are compiled to leave their results in the
- * accumulator.  Binary expressions save intermediate values on the
- * stack until they are ready to produce their result.
+ * Classic template expansion.  Rather than generating fully general
+ * code that stores to a stack, we cheat and pretend we have unlimited
+ * number of register.  A realistic codegen would do better.
+ *
+ * Expressions are compiled to leave their results in registers
+ * corresponding to the depth of the stack.
  *
  * Common subexpressions are here treated as implicitly store to a
  * local variable.  In a real compiler, this would be more explicit at
@@ -258,51 +265,99 @@ static void unparse(ast_t t)
  * Symbol table handling is unrealistically simplistic here.
  */
 
-static char *code, *cp;
+static uint32_t *code, *cp;
 static int env[256] = { ['x'] = 2, ['y'] = 3 };
-static int instructions = 0;
 static int cse_values[9999], *cse_p = cse_values;
+
+static const int reg_a0 = 10;
+// free registers {t0 .. s1, a1, ... t6}
+static int reg_poll[] = { 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                          21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
+static int next_free = 0;
+
+static void alloc(ast_t t)
+{
+        if (t->alloc) {
+                t->reg = t->alloc;
+                return;
+        }
+
+        assert(next_free < sizeof reg_poll / sizeof *reg_poll);
+        t->reg = reg_poll[next_free++];
+}
+
+static int use(ast_t t)
+{
+        int r = t->reg;
+
+        assert(t->shared > 0);
+        t->shared--;
+        if (t->shared == 0) {
+                assert(0 < next_free);
+                reg_poll[--next_free] = r;
+        }
+
+        return r;
+}
 
 static void codegen(ast_t t)
 {
-        if (t->kind == INT) {
-                *cp++ = 0xB8; // movl $<intValue>, %eax
-                *(int *)cp = t->intValue;
-                cp += 4;
-                ++instructions;
-        } else if (t->kind == NAME) {
-                *cp++ = 0xA1; // mov <env[..]>, %eax
-                *(int **)cp = &env[t->intValue];
-                cp += 4;
-                ++instructions;
-        } else {
-                // CSE part 2
-                if (t->saved) {
-                        *cp++ = 0xA1; // mov <env[..]>, %eax
-                        *(int **)cp = t->saved;
-                        cp += 4;
-                        ++instructions;
-                        return;
+        int hi = 0;
+
+        if (t->reg)
+                return;
+
+        switch (t->kind) {
+        case INT:
+                alloc(t);
+
+                hi = 0;
+                if (t->intValue & 0xFFFFF000) {
+                        // lui $reg, %hi(t->intValue)
+                        *cp++ = t->intValue & 0xFFFFF000 | t->reg << 7 | 0x37;
+                        hi = t->reg;
                 }
 
-                codegen(t->r);
-                *cp++ = 0x50; // push %eax
+                // addi $reg, $hi, %lo(t->intValue)
+                *cp++ = (t->intValue & 0xFFF) << 20 | hi << 15 | t->reg << 7 | 0x13;
+                break;
+
+        case NAME:
+                alloc(t);
+
+                // We require a0 to hold a pointer to env
+                // lw $reg, off(t0)
+                *cp++ = (t->intValue * 4) << 20 | 2 << 12 | reg_a0 << 15 | t->reg << 7 | 0x03;
+                break;
+
+        case '+': {
                 codegen(t->l);
-                *cp++ = 0x5B; // pop %ebx
-                if (t->kind == '+')
-                        *cp++ = 1, *cp++ = 0xD8; // add %ebx,%eax
-                else
-                        *cp++ = 0xF, *cp++ = 0xAF, *cp++ = 0xC3; // imul %ebx, %eax
-                instructions += 2;
+                codegen(t->r);
 
-                // CSE part 3
-                if (t->shared) {
-                        *cp++ = 0xA3; // mov %eax, <...>
-                        *(int **)cp = t->saved = cse_p++;
-                        cp += 4;
-                        ++instructions;
-                        return;
-                }
+                int r = use(t->r);
+                int l = use(t->l);
+                alloc(t);
+
+                // add $l, $l, $r
+                *cp++ = r << 20 | l << 15 | t->reg << 7 | 0x33;
+                break;
+        }
+
+        case '*': {
+                codegen(t->l);
+                codegen(t->r);
+
+                int r = use(t->r);
+                int l = use(t->l);
+                alloc(t);
+
+                // mul $reg, $reg, $(reg+1)
+                *cp++ =  1 << 25 | r << 20 | l << 15 | t->reg << 7 | 0x33;
+                break;
+        }
+
+        default:
+                assert(0);
         }
 }
 
@@ -328,7 +383,7 @@ void* alloc_executable_memory(size_t size)
 
 
 
-typedef int (*int_function_pointer)();
+typedef int (*int_function_pointer)(int *);
 
 int main(int argc, char **argv)
 {
@@ -346,15 +401,15 @@ int main(int argc, char **argv)
         printf("\n");
 
         cp = code = alloc_executable_memory(9999);
-
-        *cp++ = 0x53; // push %ebx
+        res->alloc = reg_a0;
         codegen(res);
-        *cp++ = 0x5B; // pop %ebx
-        *cp++ = 0xC3; // ret
-        ++instructions;
+        *cp++ = 0x8082; // c.ret
+
+        asm("fence.i");
+
         printf("%d instruction, value %d\n",
-               instructions,
-               ((int_function_pointer) code)());  // cast the code pointer and call it.
+               cp - code,
+               ((int_function_pointer) code)(env));  // cast the code pointer and call it.
 
         return 0;
 }
